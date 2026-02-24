@@ -4,6 +4,7 @@ from datetime import datetime
 
 import anthropic
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ─── ページ設定 ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -211,13 +212,6 @@ def render_result(original: str, result: dict):
     st.divider()
     st.subheader("添削結果")
 
-    # 全体コメント
-    if result.get("summary"):
-        st.markdown(
-            f'<div class="summary-box">💬 {result["summary"]}</div>',
-            unsafe_allow_html=True,
-        )
-
     tab_diff, tab_corrections = st.tabs(["差分表示", "修正点リスト"])
 
     with tab_diff:
@@ -229,6 +223,28 @@ def render_result(original: str, result: dict):
         with col_corr:
             st.markdown("**修正後**")
             st.markdown(f'<div class="diff-box">{corr_html}</div>', unsafe_allow_html=True)
+            corrected_json = json.dumps(result["corrected_text"])
+            copy_html = f"""<button id="copyBtn" onclick="copyToClipboard()" style="padding:4px 12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">コピー</button>
+<span id="copyMsg" style="color:green;margin-left:8px;"></span>
+<script>
+function copyToClipboard() {{
+    var text = {corrected_json};
+    navigator.clipboard.writeText(text).then(function() {{
+        document.getElementById('copyMsg').innerText = 'コピーしました！';
+        setTimeout(function() {{ document.getElementById('copyMsg').innerText = ''; }}, 2000);
+    }}).catch(function() {{
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        document.getElementById('copyMsg').innerText = 'コピーしました！';
+        setTimeout(function() {{ document.getElementById('copyMsg').innerText = ''; }}, 2000);
+    }});
+}}
+</script>"""
+            components.html(copy_html, height=50)
 
     with tab_corrections:
         corrections = result.get("corrections", [])
@@ -245,22 +261,6 @@ def render_result(original: str, result: dict):
                     unsafe_allow_html=True,
                 )
 
-    st.divider()
-    st.subheader("修正後の文章（編集可）")
-
-    # edited_textを現在の結果で初期化（初回のみ）
-    if st.session_state.edited_text != result["corrected_text"]:
-        if not st.session_state.get("tone_adjusted"):
-            st.session_state.edited_text = result["corrected_text"]
-
-    edited = st.text_area(
-        "以下を直接編集できます",
-        value=st.session_state.edited_text or result["corrected_text"],
-        height=150,
-        key="edit_area",
-    )
-    st.session_state.edited_text = edited
-
     st.markdown("**文体を調整する**")
     tone_cols = st.columns(3)
     tones = list(TONE_INSTRUCTIONS.keys())
@@ -276,7 +276,6 @@ def render_result(original: str, result: dict):
                     )
                 if adjusted:
                     st.session_state.current_result = adjusted
-                    st.session_state.edited_text = adjusted["corrected_text"]
                     st.session_state.tone_adjusted = True
                     save_to_history(
                         st.session_state.get("selected_doc_type", "その他"),
@@ -285,23 +284,13 @@ def render_result(original: str, result: dict):
                     )
                     st.rerun()
 
-    st.markdown("**コピー用**")
-    st.code(edited, language=None)
-
 
 # ─── サイドバー ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("設定")
 
-    doc_type = st.radio("文書の種類", DOC_TYPES, index=0)
+    doc_type = st.radio("文書の種類", DOC_TYPES, index=2)
     st.session_state.selected_doc_type = doc_type
-
-    context_input = st.text_input(
-        "コンテキスト（任意）",
-        placeholder="例: りす組、5歳児クラス",
-        help="クラス名や対象年齢など、添削の参考になる情報を入力します",
-    )
-    st.session_state.context_input = context_input
 
     st.divider()
 
@@ -342,6 +331,13 @@ input_text = st.text_area(
     key="input_text_area",
 )
 
+char_count = len(input_text)
+count_parts = [f"現在 {char_count} 文字"]
+if st.session_state.current_result:
+    corrected_count = len(st.session_state.current_result.get("corrected_text", ""))
+    count_parts.append(f"修正後 {corrected_count} 文字")
+st.caption("　　".join(count_parts))
+
 col_btn, col_clear = st.columns([3, 1])
 with col_btn:
     proofread_clicked = st.button("添削する", type="primary", use_container_width=True)
@@ -358,7 +354,7 @@ if proofread_clicked:
     else:
         st.session_state.tone_adjusted = False
         with st.spinner("添削中..."):
-            result = call_proofread_api(doc_type, input_text, context_input)
+            result = call_proofread_api(doc_type, input_text)
         if result:
             st.session_state.current_result = result
             st.session_state.edited_text = result["corrected_text"]
