@@ -237,7 +237,7 @@ def call_proofread_api(
         "全チェック完了後にJSONで回答してください。"
     )
 
-    try:
+ try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=2048,
