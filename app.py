@@ -237,7 +237,7 @@ def call_proofread_api(
         "全チェック完了後にJSONで回答してください。"
     )
 
- try:
+    try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             max_tokens=2048,
@@ -407,6 +407,5 @@ if proofread_clicked:
             save_to_history(doc_type, input_text, result)
 
 if st.session_state.current_result:
-    # 元テキストの特定（入力欄 or 復元された履歴）
     original = input_text or restore_text
     render_result(original, st.session_state.current_result)
