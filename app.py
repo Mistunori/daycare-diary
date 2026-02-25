@@ -1,7 +1,8 @@
 import json
+import difflib
 from datetime import datetime
 
-from openai import OpenAI, AuthenticationError as OpenAIAuthError
+import anthropic
 import streamlit as st
 import streamlit.components.v1 as components
 
@@ -15,7 +16,7 @@ st.set_page_config(
 # ─── スタイル ─────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.result-box {
+.diff-box {
     font-family: sans-serif;
     font-size: 0.95rem;
     line-height: 1.8;
@@ -26,6 +27,22 @@ st.markdown("""
     white-space: pre-wrap;
     word-break: break-all;
 }
+.del { background: #ffd7d7; text-decoration: line-through; border-radius: 3px; padding: 0 2px; }
+.ins { background: #d4f7d4; border-radius: 3px; padding: 0 2px; }
+.correction-card {
+    background: #f0f4ff;
+    border-left: 4px solid #4f7cff;
+    border-radius: 4px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 0.5rem;
+}
+.summary-box {
+    background: #fffbe6;
+    border-left: 4px solid #f0b429;
+    border-radius: 4px;
+    padding: 0.6rem 0.9rem;
+    margin-bottom: 1rem;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -34,14 +51,6 @@ DOC_TYPES = ["連絡帳", "保育日誌", "ドキュメンテーション", "そ
 
 DOC_SYSTEM_PROMPTS = {
     "ドキュメンテーション": """
-あなたは日本語ネイティブの編集者として、
-以下のルールを一字一句守って添削してください。
-ルールを守ることより自然な日本語にすることを最優先にしてください。
-添削は2回行ってください。
-1回目：文法・表現の修正
-2回目：1回目の結果を読み返し、不自然な箇所をさらに修正
-最終的に2回目の結果のみをJSONで返してください。
-
 あなたは保育ドキュメンテーションの添削・推敲の専門家です。
 以下の文体サンプルを参考に、生き生きとした自然な日本語に整えてください。
 【文体サンプル①】
@@ -92,14 +101,6 @@ DOC_SYSTEM_PROMPTS = {
 ・1文に絵文字は1つまでにする
 """,
     "連絡帳": """
-あなたは日本語ネイティブの編集者として、
-以下のルールを一字一句守って添削してください。
-ルールを守ることより自然な日本語にすることを最優先にしてください。
-添削は2回行ってください。
-1回目：文法・表現の修正
-2回目：1回目の結果を読み返し、不自然な箇所をさらに修正
-最終的に2回目の結果のみをJSONで返してください。
-
 あなたは保育園の連絡帳文章の添削・推敲の専門家です。
 【添削ルール】
 ・保護者が読んで安心・嬉しくなる温かい文体に整える
@@ -136,14 +137,6 @@ DOC_SYSTEM_PROMPTS = {
 ・1文に絵文字は1つまでにする
 """,
     "保育日誌": """
-あなたは日本語ネイティブの編集者として、
-以下のルールを一字一句守って添削してください。
-ルールを守ることより自然な日本語にすることを最優先にしてください。
-添削は2回行ってください。
-1回目：文法・表現の修正
-2回目：1回目の結果を読み返し、不自然な箇所をさらに修正
-最終的に2回目の結果のみをJSONで返してください。
-
 あなたは保育日誌文章の添削・推敲の専門家です。
 【添削ルール】
 ・事実・観察・考察を明確に区別して記録する
@@ -165,14 +158,6 @@ DOC_SYSTEM_PROMPTS = {
 ・絵文字は使用しない
 """,
     "その他": """
-あなたは日本語ネイティブの編集者として、
-以下のルールを一字一句守って添削してください。
-ルールを守ることより自然な日本語にすることを最優先にしてください。
-添削は2回行ってください。
-1回目：文法・表現の修正
-2回目：1回目の結果を読み返し、不自然な箇所をさらに修正
-最終的に2回目の結果のみをJSONで返してください。
-
 あなたは日本語文章の添削・推敲の専門家です。
 【添削ルール】
 ・読みやすく自然な日本語に整える
@@ -199,19 +184,24 @@ TONE_INSTRUCTIONS = {
 }
 
 RESPONSE_SCHEMA = {
-    "type": "json_schema",
-    "json_schema": {
-        "name": "proofread_result",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "corrected_text": {"type": "string"},
+    "type": "object",
+    "properties": {
+        "corrected_text": {"type": "string"},
+        "corrections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "original": {"type": "string"},
+                    "corrected": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["original", "corrected", "reason"],
             },
-            "required": ["corrected_text"],
-            "additionalProperties": False,
         },
+        "summary": {"type": "string"},
     },
+    "required": ["corrected_text", "corrections", "summary"],
 }
 
 # ─── セッション初期化 ──────────────────────────────────────────────────────────
@@ -224,31 +214,54 @@ if "edited_text" not in st.session_state:
 if "restore_index" not in st.session_state:
     st.session_state.restore_index = None
 
-# ─── OpenAIクライアント ──────────────────────────────────────────────────────
+# ─── Anthropicクライアント ────────────────────────────────────────────────────
 @st.cache_resource
 def get_client():
     try:
-        return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+        return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
     except Exception:
         return None
 
 client = get_client()
 
 # ─── ユーティリティ関数 ───────────────────────────────────────────────────────
+def build_inline_diff(original: str, corrected: str) -> tuple[str, str]:
+    """文字レベルの差分HTMLを生成する。"""
+    matcher = difflib.SequenceMatcher(None, original, corrected)
+    orig_html, corr_html = [], []
+    for op, i1, i2, j1, j2 in matcher.get_opcodes():
+        orig_chunk = original[i1:i2]
+        corr_chunk = corrected[j1:j2]
+        if op == "equal":
+            orig_html.append(orig_chunk)
+            corr_html.append(corr_chunk)
+        elif op == "delete":
+            orig_html.append(f'<span class="del">{orig_chunk}</span>')
+        elif op == "insert":
+            corr_html.append(f'<span class="ins">{corr_chunk}</span>')
+        elif op == "replace":
+            orig_html.append(f'<span class="del">{orig_chunk}</span>')
+            corr_html.append(f'<span class="ins">{corr_chunk}</span>')
+    return "".join(orig_html), "".join(corr_html)
+
+
 def call_proofread_api(
     doc_type: str,
     text: str,
     context: str = "",
     tone: str | None = None,
 ) -> dict | None:
-    """OpenAI APIで添削を実行してJSONを返す。"""
+    """Claude APIで添削を実行してJSONを返す。"""
     if client is None:
-        st.error("APIキーが設定されていません。`.streamlit/secrets.toml` に `OPENAI_API_KEY` を設定してください。")
+        st.error("APIキーが設定されていません。`.streamlit/secrets.toml` に `ANTHROPIC_API_KEY` を設定してください。")
         return None
 
     system_prompt = DOC_SYSTEM_PROMPTS[doc_type]
     system_prompt += (
-        "\n\n修正後の文章のみをJSONで返してください。余分な説明は不要です。"
+        "\n\n必ず以下のJSON形式のみで返答してください。余分な説明は不要です。\n"
+        '{"corrected_text": "修正後の完全な文章", '
+        '"corrections": [{"original": "元の表現", "corrected": "修正後", "reason": "理由"}], '
+        '"summary": "全体コメント"}'
     )
 
     user_content = f"【文書種別】{doc_type}\n"
@@ -258,43 +271,35 @@ def call_proofread_api(
         user_content += f"【文体調整】{TONE_INSTRUCTIONS[tone]}\n"
     user_content += f"\n【添削対象の文章】\n{text}"
     user_content += (
-        "\n\n添削後、以下を必ずチェックしてやり直してください：\n"
-        "【絶対にやってはいけないこと】\n"
-        "・「でしょう」を使う\n"
-        "・同一文内で同じ言葉を2回使う（特に「姿」「子どもたち」「様子」）\n"
-        "・時制が混在する（過去形で書いているのに途中だけ現在形にする）\n"
-        "・同時に起きた出来事を「〜すると、〜していました」と条件文でつなぐ\n"
-        "  →必ず「〜し、〜していました」と並列でつなぐこと\n"
-        "・ビジネス・SNS系の絵文字を使う（🗣️🔥💡📌✅🎯は絶対禁止）\n"
-        "・一連の動作の流れを不自然に分割する\n"
-        "・元の文の臨場感・テンポを損なう\n"
-        "【必ずやること】\n"
-        "・声に出して読んで不自然な箇所がないか確認する\n"
-        "・助詞（を・が・は・に）の誤用を修正する\n"
-        "・読点（、）の位置を自然にする\n"
-        "・主語と述語のねじれを直す\n"
-        "・文末表現が単調にならないよう「〜ました」「〜です」「〜ています」を使い分ける\n"
-        "・子どもの言葉は「」でそのまま引用して生かす\n"
-        "・元の文より不自然になっていたら元の表現を残す\n"
-        "上記チェックを全て完了してから最終的なJSONを返してください。"
+        "\n\n添削後、必ず以下を自己チェックしてから回答してください：\n"
+        "①「でしょう」を使っていないか\n"
+        "②同一文内で同じ言葉が2回出ていないか（特に「姿」「子どもたち」に注意）\n"
+        "③時制が全体で統一されているか\n"
+        "④助詞の誤用がないか\n"
+        "⑤一文が長すぎないか\n"
+        "⑥ビジネス・SNS系の絵文字（🗣️🔥💡など）を使っていないか\n"
+        "⑦全体を通して声に出して読んだとき自然に聞こえるか\n"
+        "全チェック完了後にJSONで回答してください。"
     )
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=4096,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            response_format=RESPONSE_SCHEMA,
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=2048,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_content}],
         )
-        raw = response.choices[0].message.content
+        raw = response.content[0].text.strip()
+        # コードブロックを除去
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
         return json.loads(raw)
     except json.JSONDecodeError:
         st.error("AIの応答の解析に失敗しました。もう一度お試しください。")
         return None
-    except OpenAIAuthError:
+    except anthropic.AuthenticationError:
         st.error("APIキーが無効です。`.streamlit/secrets.toml` を確認してください。")
         return None
     except Exception as e:
@@ -308,6 +313,8 @@ def save_to_history(doc_type: str, original: str, result: dict):
         "doc_type": doc_type,
         "original": original,
         "corrected": result["corrected_text"],
+        "corrections": result.get("corrections", []),
+        "summary": result.get("summary", ""),
     }
     st.session_state.history.insert(0, entry)
     if len(st.session_state.history) > 20:
@@ -319,16 +326,19 @@ def render_result(original: str, result: dict):
     st.divider()
     st.subheader("添削結果")
 
-    # 修正後テキスト表示
-    st.markdown("**修正後の文章**")
-    st.markdown(
-        f'<div class="result-box">{result["corrected_text"]}</div>',
-        unsafe_allow_html=True,
-    )
+    tab_diff, tab_corrections = st.tabs(["差分表示", "修正点リスト"])
 
-    # コピーボタン
-    corrected_json = json.dumps(result["corrected_text"])
-    copy_html = f"""<button id="copyBtn" onclick="copyToClipboard()" style="padding:4px 12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">コピー</button>
+    with tab_diff:
+        orig_html, corr_html = build_inline_diff(original, result["corrected_text"])
+        col_orig, col_corr = st.columns(2)
+        with col_orig:
+            st.markdown("**修正前**")
+            st.markdown(f'<div class="diff-box">{orig_html}</div>', unsafe_allow_html=True)
+        with col_corr:
+            st.markdown("**修正後**")
+            st.markdown(f'<div class="diff-box">{corr_html}</div>', unsafe_allow_html=True)
+            corrected_json = json.dumps(result["corrected_text"])
+            copy_html = f"""<button id="copyBtn" onclick="copyToClipboard()" style="padding:4px 12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">コピー</button>
 <span id="copyMsg" style="color:green;margin-left:8px;"></span>
 <script>
 function copyToClipboard() {{
@@ -348,9 +358,23 @@ function copyToClipboard() {{
     }});
 }}
 </script>"""
-    components.html(copy_html, height=50)
+            components.html(copy_html, height=50)
 
-    # 文体調整ボタン
+    with tab_corrections:
+        corrections = result.get("corrections", [])
+        if not corrections:
+            st.info("修正点はありませんでした。")
+        else:
+            for i, c in enumerate(corrections, 1):
+                st.markdown(
+                    f'<div class="correction-card">'
+                    f"<b>{i}. 修正前：</b>「{c['original']}」<br>"
+                    f"<b>修正後：</b>「{c['corrected']}」<br>"
+                    f"<b>理由：</b>{c['reason']}"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
     st.markdown("**文体を調整する**")
     tone_cols = st.columns(3)
     tones = list(TONE_INSTRUCTIONS.keys())
@@ -407,6 +431,8 @@ if st.session_state.restore_index is not None:
         restore_text = entry["original"]
         st.session_state.current_result = {
             "corrected_text": entry["corrected"],
+            "corrections": entry["corrections"],
+            "summary": entry["summary"],
         }
         st.session_state.edited_text = entry["corrected"]
     st.session_state.restore_index = None
