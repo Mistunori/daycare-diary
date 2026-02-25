@@ -1,5 +1,4 @@
 import json
-import difflib
 from datetime import datetime
 
 import anthropic
@@ -26,15 +25,6 @@ st.markdown("""
     border: 1px solid #e0e0e0;
     white-space: pre-wrap;
     word-break: break-all;
-}
-.del { background: #ffd7d7; text-decoration: line-through; border-radius: 3px; padding: 0 2px; }
-.ins { background: #d4f7d4; border-radius: 3px; padding: 0 2px; }
-.correction-card {
-    background: #f0f4ff;
-    border-left: 4px solid #4f7cff;
-    border-radius: 4px;
-    padding: 0.6rem 0.9rem;
-    margin-bottom: 0.5rem;
 }
 .summary-box {
     background: #fffbe6;
@@ -92,6 +82,10 @@ DOC_SYSTEM_PROMPTS = {
 ・曖昧な表現は具体的な描写に置き換える
 ・文末は「〜ました」「〜います」「〜でした」「〜ています」を
   場面に応じて使い分ける（単調にしない）
+・文章全体が「～しました」「～していました」等の事実描写のみで、
+  保育者としての気づき・読み取り・子どもの育ちへの考察が一切ない場合に限り、
+  事実から自然に読み取れる保育者視点の気づきを1〜2文だけ末尾に補足する
+  （過度な追加は禁止。元々気づきの記述がある場合は何も追加しない）
 【絵文字ルール】
 ・使ってよい絵文字は感情・自然・食べ物・動物など温かみのあるものに限定する
   例：😄😊☺️🥰♡♪☆✨🌱🌸🍀🌟💛🍛
@@ -135,6 +129,10 @@ DOC_SYSTEM_PROMPTS = {
   例：🗣️🔥💡📌✅🎯 などは絶対に使わない
 ・絵文字は文末か場面の区切りに自然に置く
 ・1文に絵文字は1つまでにする
+・文章全体が「～しました」「～していました」等の事実描写のみで、
+  保育者としての気づき・読み取り・子どもの育ちへの考察が一切ない場合に限り、
+  事実から自然に読み取れる保育者視点の気づきを1〜2文だけ末尾に補足する
+  （過度な追加は禁止。元々気づきの記述がある場合は何も追加しない）
 """,
     "保育日誌": """
 あなたは保育日誌文章の添削・推敲の専門家です。
@@ -225,31 +223,12 @@ def get_client():
 client = get_client()
 
 # ─── ユーティリティ関数 ───────────────────────────────────────────────────────
-def build_inline_diff(original: str, corrected: str) -> tuple[str, str]:
-    """文字レベルの差分HTMLを生成する。"""
-    matcher = difflib.SequenceMatcher(None, original, corrected)
-    orig_html, corr_html = [], []
-    for op, i1, i2, j1, j2 in matcher.get_opcodes():
-        orig_chunk = original[i1:i2]
-        corr_chunk = corrected[j1:j2]
-        if op == "equal":
-            orig_html.append(orig_chunk)
-            corr_html.append(corr_chunk)
-        elif op == "delete":
-            orig_html.append(f'<span class="del">{orig_chunk}</span>')
-        elif op == "insert":
-            corr_html.append(f'<span class="ins">{corr_chunk}</span>')
-        elif op == "replace":
-            orig_html.append(f'<span class="del">{orig_chunk}</span>')
-            corr_html.append(f'<span class="ins">{corr_chunk}</span>')
-    return "".join(orig_html), "".join(corr_html)
-
-
 def call_proofread_api(
     doc_type: str,
     text: str,
     context: str = "",
     tone: str | None = None,
+    age_class: str = "未選択",
 ) -> dict | None:
     """Claude APIで添削を実行してJSONを返す。"""
     if client is None:
@@ -269,6 +248,13 @@ def call_proofread_api(
         user_content += f"【コンテキスト】{context}\n"
     if tone:
         user_content += f"【文体調整】{TONE_INSTRUCTIONS[tone]}\n"
+    if age_class != "未選択":
+        user_content += (
+            f"【対象クラス】{age_class}\n"
+            "このクラスの発達段階に合わない表現がないか確認してください。\n"
+            "例：0歳児に「上手な作品ができました」等の表現は発達的に不自然です。\n"
+            "年齢相応の行動・表現・遊びの描写になるよう修正してください。\n"
+        )
     user_content += f"\n【添削対象の文章】\n{text}"
     user_content += (
         "\n\n添削後、必ず以下を自己チェックしてから回答してください：\n"
@@ -326,19 +312,13 @@ def render_result(original: str, result: dict):
     st.divider()
     st.subheader("添削結果")
 
-    tab_diff, tab_corrections = st.tabs(["差分表示", "修正点リスト"])
+    # 修正後テキスト表示
+    corrected_text = result["corrected_text"]
+    st.markdown(f'<div class="diff-box">{corrected_text}</div>', unsafe_allow_html=True)
 
-    with tab_diff:
-        orig_html, corr_html = build_inline_diff(original, result["corrected_text"])
-        col_orig, col_corr = st.columns(2)
-        with col_orig:
-            st.markdown("**修正前**")
-            st.markdown(f'<div class="diff-box">{orig_html}</div>', unsafe_allow_html=True)
-        with col_corr:
-            st.markdown("**修正後**")
-            st.markdown(f'<div class="diff-box">{corr_html}</div>', unsafe_allow_html=True)
-            corrected_json = json.dumps(result["corrected_text"])
-            copy_html = f"""<button id="copyBtn" onclick="copyToClipboard()" style="padding:4px 12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">コピー</button>
+    # コピーボタン
+    corrected_json = json.dumps(corrected_text)
+    copy_html = f"""<button id="copyBtn" onclick="copyToClipboard()" style="padding:4px 12px;cursor:pointer;border:1px solid #ccc;border-radius:4px;background:#fff;">コピー</button>
 <span id="copyMsg" style="color:green;margin-left:8px;"></span>
 <script>
 function copyToClipboard() {{
@@ -358,23 +338,14 @@ function copyToClipboard() {{
     }});
 }}
 </script>"""
-            components.html(copy_html, height=50)
+    components.html(copy_html, height=50)
 
-    with tab_corrections:
-        corrections = result.get("corrections", [])
-        if not corrections:
-            st.info("修正点はありませんでした。")
-        else:
-            for i, c in enumerate(corrections, 1):
-                st.markdown(
-                    f'<div class="correction-card">'
-                    f"<b>{i}. 修正前：</b>「{c['original']}」<br>"
-                    f"<b>修正後：</b>「{c['corrected']}」<br>"
-                    f"<b>理由：</b>{c['reason']}"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+    # 全体コメント
+    summary = result.get("summary", "")
+    if summary:
+        st.markdown(f'<div class="summary-box">{summary}</div>', unsafe_allow_html=True)
 
+    # 文体調整ボタン
     st.markdown("**文体を調整する**")
     tone_cols = st.columns(3)
     tones = list(TONE_INSTRUCTIONS.keys())
@@ -387,6 +358,7 @@ function copyToClipboard() {{
                         original,
                         st.session_state.get("context_input", ""),
                         tone=tone,
+                        age_class=st.session_state.get("selected_age_class", "未選択"),
                     )
                 if adjusted:
                     st.session_state.current_result = adjusted
@@ -405,6 +377,10 @@ with st.sidebar:
 
     doc_type = st.radio("文書の種類", DOC_TYPES, index=2)
     st.session_state.selected_doc_type = doc_type
+
+    AGE_CLASSES = ["未選択", "0歳児", "1歳児", "2歳児", "3歳児（年少）", "4歳児（年中）", "5歳児（年長）"]
+    age_class = st.selectbox("クラス年齢", AGE_CLASSES, index=0)
+    st.session_state.selected_age_class = age_class
 
     st.divider()
 
@@ -468,7 +444,7 @@ if proofread_clicked:
     else:
         st.session_state.tone_adjusted = False
         with st.spinner("添削中..."):
-            result = call_proofread_api(doc_type, input_text)
+            result = call_proofread_api(doc_type, input_text, age_class=age_class)
         if result:
             st.session_state.current_result = result
             st.session_state.edited_text = result["corrected_text"]
